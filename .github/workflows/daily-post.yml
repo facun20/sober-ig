@@ -1,0 +1,38 @@
+name: Daily IG Post
+
+on:
+  schedule:
+    - cron: "0 15 * * *"   # 15:00 UTC = 8:00am PT (morning daily thought)
+  workflow_dispatch: {}     # manual "Run workflow" button
+
+permissions:
+  contents: write           # allow pushing the updated manifest
+
+concurrency:
+  group: daily-post
+  cancel-in-progress: false
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Post next card from queue
+        env:
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+          REPO_RAW_BASE: https://raw.githubusercontent.com/${{ github.repository }}/main
+        run: python topper.py
+
+      - name: Commit updated manifest
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add manifest.json
+          git commit -m "chore: posted daily card [skip ci]" || echo "nothing to commit"
+          git push
