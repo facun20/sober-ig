@@ -15,6 +15,7 @@ import json
 import os
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
@@ -24,17 +25,35 @@ MANIFEST = os.path.join(HERE, "manifest.json")
 GRAPH = "https://graph.instagram.com/v21.0"
 
 
+def _read(resp):
+    return json.loads(resp.read().decode())
+
+
+def _err(e):
+    body = e.read().decode()
+    try:
+        return json.loads(body)
+    except Exception:
+        return {"error": {"message": body, "http_status": e.code}}
+
+
 def _post(url, params):
     data = urllib.parse.urlencode(params).encode()
     req = urllib.request.Request(url, data=data, method="POST")
-    with urllib.request.urlopen(req, timeout=60) as r:
-        return json.loads(r.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return _read(r)
+    except urllib.error.HTTPError as e:
+        return _err(e)
 
 
 def _get(url, params):
     q = urllib.parse.urlencode(params)
-    with urllib.request.urlopen(f"{url}?{q}", timeout=60) as r:
-        return json.loads(r.read().decode())
+    try:
+        with urllib.request.urlopen(f"{url}?{q}", timeout=60) as r:
+            return _read(r)
+    except urllib.error.HTTPError as e:
+        return _err(e)
 
 
 def caption_text(entry):
@@ -67,14 +86,27 @@ def main():
         print("Container creation failed:", container, file=sys.stderr)
         sys.exit(1)
 
-    # 2. publish (small retry in case the container is not ready yet)
+    # 2. wait for Meta to fetch + process the image (container -> FINISHED)
+    for _ in range(12):
+        st = _get(f"{GRAPH}/{cid}", {
+            "fields": "status_code", "access_token": token})
+        code = st.get("status_code")
+        if code == "FINISHED":
+            break
+        if code == "ERROR":
+            print("Container processing ERROR:", st, file=sys.stderr)
+            sys.exit(1)
+        time.sleep(6)
+
+    # 3. publish (retry while still settling)
     media = {}
-    for attempt in range(5):
+    for _ in range(5):
         media = _post(f"{GRAPH}/{ig_id}/media_publish", {
             "creation_id": cid, "access_token": token,
         })
         if media.get("id"):
             break
+        print("  publish not ready:", media.get("error", {}).get("message", media))
         time.sleep(8)
     mid = media.get("id")
     if not mid:
