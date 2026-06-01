@@ -37,6 +37,34 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def utc_today_date() -> str:
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+def env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def posted_at_utc_date(entry: dict[str, Any]) -> str | None:
+    posted_at = entry.get("posted_at")
+    if not isinstance(posted_at, str):
+        return None
+
+    value = posted_at.strip()
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+
+    try:
+        return datetime.fromisoformat(value).astimezone(timezone.utc).date().isoformat()
+    except ValueError:
+        return None
+
+
+def already_posted_today(manifest: list[dict[str, Any]]) -> bool:
+    today = utc_today_date()
+    return any(posted_at_utc_date(entry) == today for entry in manifest)
+
+
 def load_manifest(path: Path) -> list[dict[str, Any]]:
     try:
         with path.open("r", encoding="utf-8") as handle:
@@ -254,6 +282,11 @@ def main() -> int:
         raw_base = required_env("REPO_RAW_BASE").rstrip("/")
 
         manifest = load_manifest(manifest_path)
+
+        if not env_flag("FORCE_POST") and already_posted_today(manifest):
+            print(f"A card has already been posted for UTC date {utc_today_date()}; skipping.")
+            return 0
+
         entry = pick_next_backlog(manifest)
         if entry is None:
             print("No backlog entries remaining.")

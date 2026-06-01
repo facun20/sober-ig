@@ -3,7 +3,14 @@ name: Daily IG Post
 on:
   schedule:
     - cron: "0 15 * * *"   # 15:00 UTC = 8:00am PT (morning daily thought)
-  workflow_dispatch: {}     # manual "Run workflow" button
+  workflow_dispatch:        # manual "Run workflow" button
+    inputs:
+      force_post:
+        description: "Post even if a card was already posted today (UTC)"
+        required: false
+        default: "0"
+        type: choice
+        options: ["0", "1"]
 
 permissions:
   contents: write           # allow pushing the updated manifest
@@ -27,6 +34,7 @@ jobs:
           IG_USER_ID: ${{ secrets.IG_USER_ID }}
           IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
           REPO_RAW_BASE: https://raw.githubusercontent.com/${{ github.repository }}/main
+          FORCE_POST: ${{ github.event.inputs.force_post || '0' }}
         run: python topper.py
 
       - name: Commit updated manifest
