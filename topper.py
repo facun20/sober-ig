@@ -1,16 +1,11 @@
-"""Daily poster for the Sober Thoughts IG queue.
+"""Sober Thoughts Instagram auto-poster.
 
-Posts the next `backlog` card to Instagram via the Meta Graph API, then marks
-it `posted` in manifest.json. Designed to run once/day from GitHub Actions, so
-the cron *is* the schedule (no Buffer, no always-on machine).
-
-Env vars (set as GitHub Actions Secrets):
-  IG_USER_ID        Instagram business user id
-  IG_ACCESS_TOKEN   long-lived Instagram token
-  REPO_RAW_BASE     e.g. https://raw.githubusercontent.com/<user>/<repo>/main
-
-Image hosting: cards live in this public repo, served via raw.githubusercontent.
+Reads the next backlog item from manifest.json, publishes it to Instagram via the
+Meta Graph API, and marks the manifest entry as posted on success.
 """
+
+from __future__ import annotations
+
 import json
 import os
 import sys
@@ -19,119 +14,279 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-MANIFEST = os.path.join(HERE, "manifest.json")
-GRAPH = "https://graph.instagram.com/v21.0"
+from pathlib import Path
+from typing import Any
 
 
-def _read(resp):
-    return json.loads(resp.read().decode())
+API_BASE = "https://graph.instagram.com/v21.0"
+MAX_STATUS_POLLS = 12
+STATUS_POLL_SLEEP_SECONDS = 5
+PUBLISH_RETRIES = 5
+PUBLISH_RETRY_SLEEP_SECONDS = 5
 
 
-def _err(e):
-    body = e.read().decode()
+class MetaAPIError(Exception):
+    """Raised when Meta returns an API error or an unexpected response."""
+
+
+def stderr(message: str) -> None:
+    print(message, file=sys.stderr)
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def load_manifest(path: Path) -> list[dict[str, Any]]:
     try:
-        return json.loads(body)
-    except Exception:
-        return {"error": {"message": body, "http_status": e.code}}
+        with path.open("r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"manifest.json not found: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"manifest.json is not valid JSON: {exc}") from exc
+
+    if not isinstance(manifest, list):
+        raise RuntimeError("manifest.json must contain a JSON list")
+
+    return manifest
 
 
-def _post(url, params):
-    data = urllib.parse.urlencode(params).encode()
-    req = urllib.request.Request(url, data=data, method="POST")
+def save_manifest(path: Path, manifest: list[dict[str, Any]]) -> None:
+    with path.open("w", encoding="utf-8", newline="\n") as handle:
+        json.dump(manifest, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+
+
+def required_env(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
+
+
+def parse_meta_error(body: bytes, fallback: str) -> str:
+    if not body:
+        return fallback
+
+    text = body.decode("utf-8", errors="replace")
     try:
-        with urllib.request.urlopen(req, timeout=60) as r:
-            return _read(r)
-    except urllib.error.HTTPError as e:
-        return _err(e)
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return text or fallback
+
+    error = payload.get("error")
+    if isinstance(error, dict):
+        message = error.get("message")
+        code = error.get("code")
+        error_type = error.get("type")
+        error_subcode = error.get("error_subcode")
+
+        parts = []
+        if message:
+            parts.append(str(message))
+        if error_type:
+            parts.append(f"type={error_type}")
+        if code is not None:
+            parts.append(f"code={code}")
+        if error_subcode is not None:
+            parts.append(f"subcode={error_subcode}")
+
+        return "Meta API error: " + ", ".join(parts) if parts else json.dumps(error, ensure_ascii=False)
+
+    return text or fallback
 
 
-def _get(url, params):
-    q = urllib.parse.urlencode(params)
+def request_json(method: str, path_or_url: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    params = params or {}
+    url = path_or_url if path_or_url.startswith("http") else API_BASE + path_or_url
+
+    encoded_params = urllib.parse.urlencode(params, doseq=True).encode("utf-8")
+
+    if method.upper() == "GET":
+        if encoded_params:
+            separator = "&" if "?" in url else "?"
+            url = url + separator + encoded_params.decode("utf-8")
+        data = None
+    else:
+        data = encoded_params
+
+    request = urllib.request.Request(url, data=data, method=method.upper())
+    if data is not None:
+        request.add_header("Content-Type", "application/x-www-form-urlencoded; charset=utf-8")
+
     try:
-        with urllib.request.urlopen(f"{url}?{q}", timeout=60) as r:
-            return _read(r)
-    except urllib.error.HTTPError as e:
-        return _err(e)
+        with urllib.request.urlopen(request, timeout=60) as response:
+            response_body = response.read()
+    except urllib.error.HTTPError as exc:
+        body = exc.read()
+        raise MetaAPIError(parse_meta_error(body, f"HTTP {exc.code}: {exc.reason}")) from exc
+    except urllib.error.URLError as exc:
+        raise MetaAPIError(f"Network error: {exc.reason}") from exc
+
+    if not response_body:
+        return {}
+
+    try:
+        payload = json.loads(response_body.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise MetaAPIError(f"Meta returned non-JSON response: {response_body.decode('utf-8', errors='replace')}") from exc
+
+    if isinstance(payload, dict) and "error" in payload:
+        raise MetaAPIError(parse_meta_error(response_body, "Meta API error"))
+
+    if not isinstance(payload, dict):
+        raise MetaAPIError(f"Meta returned unexpected JSON response: {payload!r}")
+
+    return payload
 
 
-def caption_text(entry):
-    tags = " ".join(entry.get("hashtags", []))
-    return f"{entry['caption']}\n\n{tags}".strip()
-
-
-def main():
-    ig_id = os.environ["IG_USER_ID"]
-    token = os.environ["IG_ACCESS_TOKEN"]
-    raw_base = os.environ["REPO_RAW_BASE"].rstrip("/")
-
-    manifest = json.load(open(MANIFEST, encoding="utf-8"))
-    backlog = [e for e in manifest if e.get("status") == "backlog"]
+def pick_next_backlog(manifest: list[dict[str, Any]]) -> dict[str, Any] | None:
+    backlog = [entry for entry in manifest if entry.get("status") == "backlog"]
     if not backlog:
-        print("Queue empty. Nothing to post.")
-        return
-    entry = sorted(backlog, key=lambda e: e["id"])[0]
-    image_url = f"{raw_base}/{entry['card_file']}"
-    caption = caption_text(entry)
+        return None
+    return sorted(backlog, key=lambda entry: str(entry.get("id", "")))[0]
 
-    print(f"Posting card {entry['id']} ({entry['mode']}) -> {image_url}")
 
-    # 1. create media container
-    container = _post(f"{GRAPH}/{ig_id}/media", {
-        "image_url": image_url, "caption": caption, "access_token": token,
-    })
-    cid = container.get("id")
-    if not cid:
-        print("Container creation failed:", container, file=sys.stderr)
-        sys.exit(1)
+def validate_entry(entry: dict[str, Any]) -> None:
+    required_fields = ("id", "card_file", "caption", "hashtags", "status")
+    missing = [field for field in required_fields if field not in entry]
+    if missing:
+        raise RuntimeError(f"Manifest entry is missing required field(s): {', '.join(missing)}")
 
-    # 2. wait for Meta to fetch + process the image (container -> FINISHED)
-    for _ in range(12):
-        st = _get(f"{GRAPH}/{cid}", {
-            "fields": "status_code", "access_token": token})
-        code = st.get("status_code")
-        if code == "FINISHED":
-            break
-        if code == "ERROR":
-            print("Container processing ERROR:", st, file=sys.stderr)
-            sys.exit(1)
-        time.sleep(6)
+    if not isinstance(entry["hashtags"], list) or not all(isinstance(tag, str) for tag in entry["hashtags"]):
+        raise RuntimeError(f"Manifest entry {entry.get('id')} has invalid hashtags; expected list of strings")
 
-    # 3. publish (retry while still settling)
-    media = {}
-    for _ in range(5):
-        media = _post(f"{GRAPH}/{ig_id}/media_publish", {
-            "creation_id": cid, "access_token": token,
-        })
-        if media.get("id"):
-            break
-        print("  publish not ready:", media.get("error", {}).get("message", media))
-        time.sleep(8)
-    mid = media.get("id")
-    if not mid:
-        print("Publish failed:", media, file=sys.stderr)
-        sys.exit(1)
 
-    # 3. fetch permalink (best effort)
-    permalink = ""
+def create_container(user_id: str, image_url: str, caption: str, access_token: str) -> str:
+    payload = request_json(
+        "POST",
+        f"/{urllib.parse.quote(user_id)}/media",
+        {
+            "image_url": image_url,
+            "caption": caption,
+            "access_token": access_token,
+        },
+    )
+
+    container_id = payload.get("id")
+    if not container_id:
+        raise MetaAPIError(f"Meta did not return a creation container id: {payload}")
+
+    return str(container_id)
+
+
+def wait_for_container(container_id: str, access_token: str) -> None:
+    quoted_container_id = urllib.parse.quote(container_id)
+
+    for attempt in range(1, MAX_STATUS_POLLS + 1):
+        payload = request_json(
+            "GET",
+            f"/{quoted_container_id}",
+            {
+                "fields": "status_code",
+                "access_token": access_token,
+            },
+        )
+
+        status = payload.get("status_code")
+        if status == "FINISHED":
+            return
+        if status in {"ERROR", "EXPIRED"}:
+            raise MetaAPIError(f"Creation container {container_id} ended with status_code={status}: {payload}")
+
+        if attempt < MAX_STATUS_POLLS:
+            time.sleep(STATUS_POLL_SLEEP_SECONDS)
+
+    raise MetaAPIError(f"Creation container {container_id} was not ready after {MAX_STATUS_POLLS} polls")
+
+
+def publish_media(user_id: str, container_id: str, access_token: str) -> str:
+    last_error: Exception | None = None
+
+    for attempt in range(1, PUBLISH_RETRIES + 1):
+        try:
+            payload = request_json(
+                "POST",
+                f"/{urllib.parse.quote(user_id)}/media_publish",
+                {
+                    "creation_id": container_id,
+                    "access_token": access_token,
+                },
+            )
+            media_id = payload.get("id")
+            if not media_id:
+                raise MetaAPIError(f"Meta did not return a published media id: {payload}")
+            return str(media_id)
+        except MetaAPIError as exc:
+            last_error = exc
+            if attempt < PUBLISH_RETRIES:
+                time.sleep(PUBLISH_RETRY_SLEEP_SECONDS)
+
+    raise MetaAPIError(f"Media publish failed after {PUBLISH_RETRIES} attempts: {last_error}")
+
+
+def get_permalink(media_id: str, access_token: str) -> str:
     try:
-        permalink = _get(f"{GRAPH}/{mid}", {
-            "fields": "permalink", "access_token": token}).get("permalink", "")
-    except Exception:
-        pass
+        payload = request_json(
+            "GET",
+            f"/{urllib.parse.quote(media_id)}",
+            {
+                "fields": "permalink",
+                "access_token": access_token,
+            },
+        )
+    except MetaAPIError as exc:
+        stderr(f"Warning: could not fetch permalink: {exc}")
+        return ""
 
-    entry["status"] = "posted"
-    entry["posted_media_id"] = mid
-    entry["posted_at"] = datetime.now(timezone.utc).isoformat()
-    entry["permalink"] = permalink
-    json.dump(manifest, open(MANIFEST, "w", encoding="utf-8"),
-              indent=2, ensure_ascii=False)
+    permalink = payload.get("permalink")
+    return str(permalink) if permalink else ""
 
-    remaining = sum(1 for e in manifest if e.get("status") == "backlog")
-    print(f"POSTED {entry['id']}  media={mid}  {permalink}")
-    print(f"Backlog remaining: {remaining}")
+
+def main() -> int:
+    try:
+        script_dir = Path(__file__).resolve().parent
+        manifest_path = script_dir / "manifest.json"
+
+        ig_user_id = required_env("IG_USER_ID")
+        access_token = required_env("IG_ACCESS_TOKEN")
+        raw_base = required_env("REPO_RAW_BASE").rstrip("/")
+
+        manifest = load_manifest(manifest_path)
+        entry = pick_next_backlog(manifest)
+        if entry is None:
+            print("No backlog entries remaining.")
+            return 0
+
+        validate_entry(entry)
+
+        card_file = str(entry["card_file"]).lstrip("/")
+        image_url = f"{raw_base}/{card_file}"
+        caption = str(entry["caption"]) + "\n\n" + " ".join(str(tag) for tag in entry["hashtags"])
+
+        container_id = create_container(ig_user_id, image_url, caption, access_token)
+        wait_for_container(container_id, access_token)
+        media_id = publish_media(ig_user_id, container_id, access_token)
+        permalink = get_permalink(media_id, access_token)
+
+        entry["status"] = "posted"
+        entry["posted_media_id"] = media_id
+        entry["posted_at"] = utc_now_iso()
+        entry["permalink"] = permalink
+
+        save_manifest(manifest_path, manifest)
+
+        remaining = sum(1 for item in manifest if item.get("status") == "backlog")
+        print(permalink or media_id)
+        print(f"Remaining backlog count: {remaining}")
+        return 0
+
+    except (RuntimeError, MetaAPIError) as exc:
+        stderr(str(exc))
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
+
