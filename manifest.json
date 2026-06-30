@@ -1240,8 +1240,11 @@
       "#morningmotivation",
       "#healthyhabits"
     ],
-    "status": "backlog",
-    "engine": "gemini"
+    "status": "posted",
+    "engine": "gemini",
+    "posted_media_id": "18589878055016192",
+    "posted_at": "2026-06-30T17:02:22.441767Z",
+    "permalink": "https://www.instagram.com/p/DaN7oZdlqaF/"
   },
   {
     "id": "033",
